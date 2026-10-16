@@ -1,6 +1,7 @@
 // All personal values come from the environment; see .env.example.
 import { homedir } from "os";
 import { join, resolve } from "path";
+import { agentKind, type AgentKind } from "./providers";
 
 export type Config = {
   token: string;
@@ -13,6 +14,8 @@ export type Config = {
   sim: boolean;
   autosendExt: Set<string>;
   claudeArgs: string[];
+  agentKind: AgentKind;
+  codexArgs: string[];
   statusIntervalSec: number;
   onlineWindowSec: number;
   statusPauseAfter: number; // abnormal and unchanged this many beats in a row -> stop editing the pinned status
@@ -35,6 +38,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const workdir = need("TG_BRIDGE_WORKDIR");
   if (missing.length) throw new Error(`missing required config: ${missing.join(", ")} (see .env.example)`);
   const expand = (p: string) => resolve(p.replace(/^~(?=\/|$)/, homedir()));
+  const kind = agentKind(env.TG_AGENT_KIND?.trim() || "claude");
+  if (!kind) throw new Error("TG_AGENT_KIND must be claude or codex");
+  let codexArgs: unknown;
+  try { codexArgs = JSON.parse(env.TG_CODEX_ARGS || "[]"); }
+  catch { throw new Error("TG_CODEX_ARGS must be a JSON array of strings"); }
+  if (!Array.isArray(codexArgs) || !codexArgs.every(x => typeof x === "string"))
+    throw new Error("TG_CODEX_ARGS must be a JSON array of strings");
   return {
     token,
     chatId: Number(chat),
@@ -46,6 +56,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     sim: env.TG_BRIDGE_SIM === "1",
     autosendExt: new Set((env.TG_AUTOSEND_EXT ?? DEFAULT_EXT).split(",").map(s => s.trim().toLowerCase().replace(/^\./, "")).filter(Boolean)),
     claudeArgs: (env.TG_CLAUDE_ARGS ?? "").split(/\s+/).filter(Boolean),
+    agentKind: kind,
+    codexArgs,
     statusIntervalSec: Number(env.TG_STATUS_INTERVAL ?? 30),
     onlineWindowSec: Number(env.TG_ONLINE_WINDOW ?? 90),
     statusPauseAfter: Number(env.TG_STATUS_PAUSE_AFTER ?? 3),

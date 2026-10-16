@@ -1,8 +1,6 @@
 // One Watcher per bound topic: polls Herdr status, tails the transcript, renders the turn into Telegram.
 import { existsSync } from "fs";
-import { Glob } from "bun";
 import { homedir } from "os";
-import { join } from "path";
 import type { Config } from "./config";
 import * as H from "./herdr";
 import { log } from "./log";
@@ -10,13 +8,14 @@ import { pickOutbox } from "./outbox";
 import { bubble, commentLine, cut, esc, mdChunks, toolLine } from "./render";
 import type { Binding, Store } from "./store";
 import { REACT, type SendState, type Telegram } from "./telegram";
-import { TranscriptTail, transcriptPath, type TEvent } from "./transcript";
+import { TranscriptTail, findSessionTranscript, transcriptParser, type TEvent } from "./transcript";
+import { reportedKind } from "./providers";
 import { parseCtx, type Ctx } from "./usage";
 import { tr } from "./i18n";
 
 type Turn = {
   bubble?: number; lines: string[]; texts: string[]; calls: number; t0: number;
-  lastEdit: number; dirty: boolean; sawWorking: boolean; written: string[]; ended?: boolean;
+  lastEdit: number; dirty: boolean; sawWorking: boolean; written: string[];
   msgs: number[]; // Telegram messages this turn answers: they get its outcome as a reaction
 };
 // What the last answer was made of and whether each part is known to have arrived, for /resend.
@@ -25,12 +24,7 @@ const NO_BUBBLE = -1; // the bubble send had no reply: sending another could sho
 
 const CTX_WARN = 80;
 
-export function findTranscript(cwd: string, session: string): string {
-  const p = transcriptPath(cwd, session);
-  if (existsSync(p)) return p;
-  for (const hit of new Glob(`*/${session}.jsonl`).scanSync(join(homedir(), ".claude/projects"))) return join(homedir(), ".claude/projects", hit);
-  return p;
-}
+export const findTranscript = findSessionTranscript;
 
 export class Watcher {
   status = "unknown";
@@ -44,10 +38,16 @@ export class Watcher {
   ctx?: Ctx; // latest context reading from Herdr
   private afterEnd = false; // turn closed by end_turn while Herdr still says working: wait for new transcript activity
   private busy = 0; // start time of the running tick, 0 when idle
+  private nextNameCheck = 0;
+  private nameSync?: Promise<void>;
+  private stopped = false;
   private timer: Timer;
 
   constructor(public thread: number, public bind: Binding, private cfg: Config, private tg: Telegram, private store: Store) {
-    if (bind.session) this.tail = new TranscriptTail(findTranscript(bind.cwd, bind.session), true);
+    if (bind.session) {
+      const path = findTranscript(bind.cwd, bind.session, bind.kind);
+      if (path && existsSync(path)) this.tail = new TranscriptTail(path, true, transcriptParser(bind.kind));
+    }
     this.timer = setInterval(async () => {
       if (this.busy) {
         // a tick that never settles would silence this topic for good: drop it and carry on
@@ -59,7 +59,7 @@ export class Watcher {
     }, 1000);
   }
 
-  stop() { clearInterval(this.timer); }
+  stop() { this.stopped = true; clearInterval(this.timer); }
 
   noteFromTg(text: string, msg?: number) {
     this.fromTg.push({ text: text.trim(), msg, at: Date.now() });
@@ -86,6 +86,7 @@ export class Watcher {
     }
     this.missing = 0;
     const a = st.agent!;
+    this.queueTabNameSync(a);
     this.ctx = parseCtx(a.tokens?.context) ?? this.ctx;
     if (this.bind.notified || (!this.bind.terminal && st.terminal)) {
       this.bind.notified = undefined;
@@ -93,19 +94,23 @@ export class Watcher {
       this.store.save();
     }
     const sid = a.agent_session?.value;
-    if (sid && sid !== this.bind.session) {
+    const kind = reportedKind(a) ?? this.bind.kind ?? "claude";
+    if (sid && (sid !== this.bind.session || kind !== (this.bind.kind ?? "claude"))) {
       // new session in the same pane (/clear, restart): read the new transcript from its start
       this.bind.session = sid;
+      this.bind.kind = kind;
       this.store.save();
-      this.tail = new TranscriptTail(findTranscript(this.bind.cwd, sid), false);
+      this.tail = undefined;
+    }
+    if (this.bind.session && !this.tail) {
+      const path = findTranscript(this.bind.cwd, this.bind.session, this.bind.kind);
+      if (path && existsSync(path)) this.tail = new TranscriptTail(path, false, transcriptParser(this.bind.kind));
     }
     const prev = this.status;
     this.status = a.agent_status;
     if (this.status === "working" && !this.afterEnd) { this.turn ??= this.newTurn(); this.turn.sawWorking = true; }
     if (prev === "blocked" && this.status === "working") this.mark(REACT.working);
-    for (const ev of this.tail?.read() ?? []) await this.onEvent(ev);
-    // background agents keep Herdr at "working" after the reply is done; the transcript says when the turn ended
-    if (this.turn?.ended) { await this.finish(); this.afterEnd = this.status === "working"; return; }
+    await this.consume(this.tail?.read() ?? []);
     if (this.status !== "working") this.afterEnd = false;
     if (this.turn) await this.render(false);
     if (this.status === "blocked" && prev !== "blocked") await this.onBlocked();
@@ -118,7 +123,7 @@ export class Watcher {
     if (this.bind.notified) return;
     this.bind.notified = true;
     this.store.save();
-    const resumable = !!this.bind.session && existsSync(findTranscript(this.bind.cwd, this.bind.session));
+    const resumable = !!this.bind.session && existsSync(findTranscript(this.bind.cwd, this.bind.session, this.bind.kind));
     const what = state === "exited" ? tr("这个会话在电脑上退出了", "This session exited on the computer") : tr("电脑上这个会话的标签页关掉了", "This session's tab was closed on the computer");
     const next = resumable ? tr("直接发消息会接着原会话", "send a message to resume it") : tr("直接发消息会开一个新会话", "send a message to start a new session");
     const row = [
@@ -131,8 +136,8 @@ export class Watcher {
 
   private async onEvent(ev: TEvent) {
     if (ev.kind === "title") return this.onTitle(ev.title);
+    if (ev.kind === "end" || ev.kind === "aborted") return;
     this.afterEnd = false;
-    if (ev.kind === "end") { if (this.turn) this.turn.ended = true; return; }
     if (ev.kind === "user" || ev.kind === "queued") {
       if (ev.text.startsWith("<")) return; // command / system wrappers
       this.turn ??= this.newTurn();
@@ -145,6 +150,7 @@ export class Watcher {
     }
     this.turn ??= this.newTurn();
     const t = this.turn;
+    if (ev.kind === "commentary") { t.lines.push(commentLine(ev.text)); t.dirty = true; return; }
     if (ev.kind === "text") { t.texts.push(ev.text); return; }
     if (t.texts.length) { t.lines.push(...t.texts.map(commentLine)); t.texts = []; }
     t.calls++;
@@ -167,9 +173,23 @@ export class Watcher {
     t.bubble = r.id ?? (r.state === "unknown" ? NO_BUBBLE : undefined);
   }
 
-  private async finish() {
-    for (const ev of this.tail?.read() ?? []) await this.onEvent(ev);
+  private async consume(events: TEvent[]) {
+    // Finish at each boundary before reading the next turn, even when several turns arrive in one poll.
+    for (const ev of events) {
+      await this.onEvent(ev);
+      if ((ev.kind === "end" || ev.kind === "aborted") && this.turn) {
+        await this.finish(ev.kind === "aborted");
+        this.afterEnd = this.status === "working";
+      }
+    }
+  }
+
+  private async finish(aborted = false) {
     const t = this.turn!;
+    if (aborted) {
+      t.texts = [];
+      t.lines.push(tr("⏹ 本轮已中断", "⏹ This turn was interrupted"));
+    }
     await this.render(true);
     this.turn = undefined;
     this.bind.lastActive = Date.now();
@@ -230,7 +250,7 @@ export class Watcher {
   }
 
   private async onBlocked() {
-    for (const ev of this.tail?.read() ?? []) await this.onEvent(ev);
+    await this.consume(this.tail?.read() ?? []);
     this.mark(REACT.ask);
     const ask = this.lastAsk;
     if (ask && !this.askedIds.has(ask.id)) {
@@ -251,10 +271,32 @@ export class Watcher {
   }
 
   private async onTitle(title: string) {
-    if (!this.bind.autoName || this.bind.title === title) return;
+    if (this.bind.attached || !this.bind.autoName || this.bind.title === title) return;
     this.bind.title = title;
     this.store.save();
     await this.tg.call("editForumTopic", { chat_id: this.tg.chatId, message_thread_id: this.thread, name: cut(title, 120) });
     if (this.bind.tab && !this.bind.attached) await H.tabRename(this.bind.tab, title); // a desktop tab keeps its own name
+  }
+
+  // Attached desktop sessions follow Herdr's tab label, including manual renames.
+  // Failed edits remain retryable; a transcript-generated title never overwrites the user's tab name.
+  private queueTabNameSync(a: H.Agent) {
+    if (this.stopped || !this.bind.attached || this.nameSync || Date.now() < this.nextNameCheck) return;
+    this.nameSync = this.syncTabName(a).catch(e => log("topic name sync", this.thread, e)).finally(() => {
+      this.nextNameCheck = Date.now() + 10_000;
+      this.nameSync = undefined;
+    });
+  }
+
+  private async syncTabName(a: H.Agent) {
+    const label = await H.tabLabel(a.workspace_id, a.tab_id);
+    if (!label || this.stopped) return;
+    const name = cut(label, 120);
+    if (name === this.bind.title) return;
+    const r = await this.tg.call("editForumTopic", { chat_id: this.tg.chatId, message_thread_id: this.thread, name });
+    if (this.stopped || this.store.state.topics[this.thread] !== this.bind) return;
+    if (!r.ok && !String(r.description).includes("TOPIC_NOT_MODIFIED")) return;
+    this.bind.title = name;
+    this.store.save();
   }
 }

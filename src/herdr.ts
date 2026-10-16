@@ -1,5 +1,6 @@
 // Thin wrapper over the herdr CLI (JSON output over its socket API).
 import { log } from "./log";
+import type { AgentKind } from "./providers";
 
 export async function herdr(...args: string[]): Promise<any> {
   const p = Bun.spawn(["herdr", ...args], { stdout: "pipe", stderr: "pipe" });
@@ -12,8 +13,9 @@ export async function herdr(...args: string[]): Promise<any> {
 }
 
 export type Agent = {
+  agent_kind?: string; kind?: string; agent?: string;
   pane_id: string; tab_id: string; workspace_id: string; agent_status: string;
-  agent_session?: { value: string }; cwd: string; terminal_title_stripped?: string;
+  agent_session?: { value: string; source?: string }; cwd: string; terminal_title_stripped?: string;
   terminal_id?: string; tokens?: Record<string, string>; // tokens.context, e.g. "⛁ 43% (430k)", for hooked Claude sessions
 };
 
@@ -22,6 +24,13 @@ export const prompt = (pane: string, text: string) => herdr("agent", "prompt", p
 export const sendKeys = (pane: string, keys: string[]) => herdr("pane", "send-keys", pane, ...keys);
 export const paneRead = async (pane: string) => { const r = await herdr("pane", "read", pane); return typeof r === "string" ? r : ""; };
 export const tabRename = (tab: string, label: string) => herdr("tab", "rename", tab, label);
+
+// The user-visible tab label is different from the agent's terminal/session title.
+export async function tabLabel(workspace: string, tab: string): Promise<string | undefined> {
+  const r = await herdr("tab", "list", "--workspace", workspace);
+  const value = r?.result?.tabs?.find((t: any) => t.tab_id === tab)?.label;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
 
 export async function workspaces(): Promise<any[] | undefined> {
   const r = await herdr("workspace", "list");
@@ -60,7 +69,7 @@ export async function paneState(pane: string, terminal?: string): Promise<PaneSt
 
 // Starts Claude in `pane` (an existing shell pane, e.g. one left behind by /exit) or in a new tab.
 // `label` is the tab label (any text); `agent` is the Herdr agent name, which must match [a-z][a-z0-9_-]{0,31}.
-export async function spawnClaude(opts: { workspace?: string; cwd: string; label: string; agent: string; args: string[]; pane?: string }) {
+export async function spawnAgent(opts: { kind: AgentKind; workspace?: string; cwd: string; label: string; agent: string; args: string[]; pane?: string }) {
   let pane = opts.pane;
   let tab: string | undefined;
   if (pane) tab = (await paneGet(pane))?.tab_id;
@@ -76,7 +85,7 @@ export async function spawnClaude(opts: { workspace?: string; cwd: string; label
   let a: any;
   for (let i = 0; i < 10 && !a; i++) {
     if (i) await Bun.sleep(500);
-    const st = await herdr("agent", "start", opts.agent, "--kind", "claude", "--pane", pane, ...(opts.args.length ? ["--", ...opts.args] : []));
+    const st = await herdr("agent", "start", opts.agent, "--kind", opts.kind, "--pane", pane, ...(opts.args.length ? ["--", ...opts.args] : []));
     a = st?.result?.agent;
     if (st?.error?.code && st.error.code !== "agent_pane_busy") break; // only "busy" is worth waiting for
   }

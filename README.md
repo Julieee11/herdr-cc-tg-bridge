@@ -4,6 +4,9 @@
 
 herdr-cc-tg-bridge connects a Telegram group (with Topics enabled) to the Claude Code sessions running in Herdr on your computer. What you drive from your phone *is* the session on your desk: same memory, same `CLAUDE.md`, same hooks and skills. Back at the computer, keep typing in the same Herdr tab.
 
+**Codex support:** `/new codex name` starts Codex; `/new claude name` starts Claude. Existing Claude topics keep their behavior. Run `bin/tg-bind` inside a live Herdr Codex session to attach it. See [Codex setup and scope](docs/PRD-v3-codex.md).
+
+
 It is a small Bun program with no runtime dependencies. The command it installs is called `tg-bridge`.
 
 *Independent project. Not affiliated with, or endorsed by, Anthropic. It runs the unmodified Claude Code CLI under your own account.*

@@ -9,7 +9,8 @@ import { cut, esc, mdChunks } from "./render";
 import { findTranscript, Watcher } from "./session";
 import type { Binding, Store } from "./store";
 import type { Telegram } from "./telegram";
-import { parseLine } from "./transcript";
+import { transcriptParser } from "./transcript";
+import { launchArgs, reportedKind, type AgentKind } from "./providers";
 import { parseCtx } from "./usage";
 import { tr } from "./i18n";
 
@@ -29,16 +30,21 @@ export const ago = (t: number | undefined, now = Date.now()) => {
 export const cleanTitle = (t?: string) => (t ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
 
 // Last finished exchange in a transcript: the last real user prompt and the reply that closed its turn.
-export function lastExchange(text: string): { ask?: string; answer?: string; title?: string } {
+export function lastExchange(text: string, kind: AgentKind = "claude"): { ask?: string; answer?: string; title?: string } {
   let ask: string | undefined, answer: string | undefined, title: string | undefined;
   let pendingAsk: string | undefined, texts: string[] = [];
+  const parse = transcriptParser(kind);
   for (const line of text.split("\n")) {
-    for (const ev of parseLine(line)) {
+    for (const ev of parse(line)) {
       if (ev.kind === "title") title = ev.title;
       else if (ev.kind === "user" && !ev.text.startsWith("<")) { pendingAsk = ev.text; texts = []; }
       else if (ev.kind === "text") texts.push(ev.text);
       else if (ev.kind === "tool") texts = [];
-      else if (ev.kind === "end") { ask = pendingAsk ?? ask; answer = texts.join("\n\n").trim() || answer; texts = []; }
+      else if (ev.kind === "end") {
+        const final = texts.join("\n\n").trim();
+        if (final) { ask = pendingAsk ?? ask; answer = final; }
+        pendingAsk = undefined; texts = [];
+      } else if (ev.kind === "aborted") { pendingAsk = undefined; texts = []; }
     }
   }
   return { ask, answer, title };
@@ -51,6 +57,7 @@ const STATE_LABEL = (): Record<string, string> => ({
 
 export class Lifecycle {
   private checking = new Set<number>();
+  private attaches = new Map<string, Promise<unknown>>();
 
   constructor(
     private cfg: Config, private tg: Telegram, private store: Store,
@@ -71,7 +78,7 @@ export class Lifecycle {
     this.watchers.delete(thread);
   }
 
-  canResume(b?: Binding) { return !!b?.session && existsSync(findTranscript(b.cwd, b.session)); }
+  canResume(b?: Binding) { return !!b?.session && existsSync(findTranscript(b.cwd, b.session, b.kind)); }
 
   // "Herdr TELEGRAM / 周报草稿": where the session lives, in words the user recognises
   private async where(workspace?: string, tab?: string) {
@@ -81,7 +88,7 @@ export class Lifecycle {
 
   // Make the topic's session live. Resumes the bound session (claude --resume) unless `fresh`; reuses a pane that
   // is left with a shell; reopens the topic if it was closed. Returns false when no session could be started.
-  async open(thread: number, opts: { name?: string; autoName?: boolean; fresh?: boolean } = {}): Promise<boolean> {
+  async open(thread: number, opts: { name?: string; autoName?: boolean; fresh?: boolean; kind?: AgentKind } = {}): Promise<boolean> {
     const old = this.store.state.topics[thread];
     // a closed desktop session is normally still running, so look at the pane even when the binding is closed
     const st = old ? await H.paneState(old.pane, old.terminal) : undefined;
@@ -99,18 +106,22 @@ export class Lifecycle {
     if (st?.state === "live" && !old!.attached) await H.paneClose(old!.pane);
 
     const resume = !opts.fresh && this.canResume(old);
+    const kind = opts.kind ?? old?.kind ?? (old ? "claude" : this.cfg.agentKind ?? "claude");
     const label = cut(this.name(thread, old ?? { name: opts.name } as Binding), 40);
     const ws = await H.resolveWorkspace(this.cfg.workspace);
-    const s = await H.spawnClaude({
+    const s = await H.spawnAgent({
+      kind,
       workspace: ws,
       cwd: resume ? old!.cwd : this.cfg.workdir, label, agent: `tg-${thread}`,
       pane: st?.state === "exited" && !old!.attached ? old!.pane : undefined,
-      args: [...(resume ? ["--resume", old!.session!] : []), "--append-system-prompt", SPAWN_PROMPT(this.tgSendPath), ...this.cfg.claudeArgs],
+      args: launchArgs(kind, resume ? old!.session : undefined,
+        kind === "codex" ? this.cfg.codexArgs ?? [] : this.cfg.claudeArgs, SPAWN_PROMPT(this.tgSendPath)),
     });
     if (!s) { await this.tg.notice(thread, tr("❌ 开会话失败，Herdr 没有返回窗格", "❌ Could not open a session: Herdr returned no pane")); return false; }
     this.unwatch(thread);
     this.store.state.topics[thread] = {
       ...(old ?? { cwd: this.cfg.workdir, name: opts.name, autoName: opts.autoName ?? false }),
+      kind,
       pane: s.pane, tab: s.tab, terminal: s.terminal,
       session: s.session ?? (resume ? old!.session : undefined),
       cwd: resume ? old!.cwd : this.cfg.workdir,
@@ -124,35 +135,54 @@ export class Lifecycle {
   }
 
   // /tg-bind from inside a desktop session: new topic, handoff card, last answer, then live sync.
-  async attach(pane: string): Promise<{ ok: boolean; thread?: number; error?: string; already?: boolean }> {
-    const bound = this.store.topicOfPane(pane);
-    if (bound) return { ok: true, thread: bound, already: true };
+  async attach(pane: string, expected?: { kind?: AgentKind; session?: string }): Promise<{ ok: boolean; thread?: number; error?: string; already?: boolean }> {
+    // Concurrent local bind calls must not both create a topic for the same pane.
+    const before = this.attaches.get(pane) ?? Promise.resolve();
+    const current = before.catch(() => {}).then(() => this.attachOnce(pane, expected));
+    this.attaches.set(pane, current);
+    try { return await current; }
+    finally { if (this.attaches.get(pane) === current) this.attaches.delete(pane); }
+  }
+
+  private async attachOnce(pane: string, expected?: { kind?: AgentKind; session?: string }): Promise<{ ok: boolean; thread?: number; error?: string; already?: boolean }> {
     const st = await H.paneState(pane);
+    if (st.state === "unknown") return { ok: false, error: "Herdr is not answering" };
+    if (st.state !== "live") return { ok: false, error: "no supported agent session is running in this pane" };
+    const a = st.agent!;
+    const session = a.agent_session?.value;
+    if (!session) return { ok: false, error: "Herdr has no session id for this pane; install the agent's Herdr integration and restart the session" };
+    if (expected?.session && expected.session !== session)
+      return { ok: false, error: "session id does not match this Herdr pane; refusing to bind another session" };
+    const kind = reportedKind(a) ?? (existsSync(findTranscript(a.cwd, session, "codex")) ? "codex" : "claude");
+    if (expected?.kind && expected.kind !== kind)
+      return { ok: false, error: "agent kind does not match this Herdr pane" };
+    const path = findTranscript(a.cwd, session, kind);
+    if (!path || !existsSync(path)) return { ok: false, error: `${kind} transcript not found for this session; no topic was created` };
+    const bound = this.store.topicOfPane(pane);
+    const current = bound ? this.store.state.topics[bound] : undefined;
+    if (current && current.terminal && current.terminal !== st.terminal)
+      return { ok: false, error: "pane terminal changed; disconnect the old binding first" };
+    if (bound) return { ok: true, thread: bound, already: true };
     // bound before and then closed in Telegram: reopen that topic rather than open a second one for the same pane
     const closed = Object.entries(this.store.state.topics).find(([, b]) => b.pane === pane && b.closedAt && b.terminal === st.terminal);
     if (closed && st.state === "live") {
       const ok = await this.open(Number(closed[0]));
       return ok ? { ok, thread: Number(closed[0]) } : { ok, error: "could not reopen the earlier topic" };
     }
-    if (st.state === "unknown") return { ok: false, error: "Herdr is not answering" };
-    if (st.state !== "live") return { ok: false, error: "no Claude session is running in this pane" };
-    const a = st.agent!;
-    const session = a.agent_session?.value;
-    if (!session) return { ok: false, error: "Herdr has no session id for this pane: the session was started before `herdr integration install claude`, so its transcript cannot be found" };
-    const path = findTranscript(a.cwd, session);
-    const ex = existsSync(path) ? lastExchange(readFileSync(path, "utf8")) : {};
-    const title = cut(ex.title || cleanTitle(a.terminal_title_stripped) || tr("电脑会话", "Desktop session"), 120);
+    const ex = lastExchange(readFileSync(path, "utf8"), kind);
+    const tabTitle = await H.tabLabel(a.workspace_id, a.tab_id);
+    const title = cut(tabTitle || ex.title || cleanTitle(a.terminal_title_stripped) || tr("电脑会话", "Desktop session"), 120);
     const j = await this.tg.call("createForumTopic", { chat_id: this.cfg.chatId, name: title });
     if (!j.ok) return { ok: false, error: `createForumTopic failed: ${j.description}` };
     const thread: number = j.result.message_thread_id;
     this.store.state.topics[thread] = {
-      pane, tab: a.tab_id, terminal: a.terminal_id, session, cwd: a.cwd,
+      pane, kind, tab: a.tab_id, terminal: a.terminal_id, session, cwd: a.cwd,
       name: title, title, autoName: true, attached: true, lastActive: Date.now(),
     };
     this.store.save();
     const ctx = parseCtx(a.tokens?.context);
     const card = [
-      `🔗 <b>${tr("已从电脑接过来", "Taken over from the computer")}</b> · ${await this.where(a.workspace_id, cleanTitle(a.terminal_title_stripped))}`,
+      `🔗 <b>${tr("已从电脑接过来", "Taken over from the computer")}</b> · ${await this.where(a.workspace_id, tabTitle || cleanTitle(a.terminal_title_stripped))}`,
       `${tr("目录", "Folder")} <code>${esc(a.cwd.replace(homedir(), "~"))}</code>${ctx ? ` · ctx ${esc(ctx.text)}` : ""}`,
       ex.ask ? tr(`上一轮你问的是「${esc(cut(ex.ask.replace(/\s+/g, " "), 300))}」，回答在下面`, `Last time you asked "${esc(cut(ex.ask.replace(/\s+/g, " "), 300))}"; the answer is below`) : "",
       tr("在这里发消息，就是在电脑上那个会话里发。关闭或删除这个话题只断开 Telegram，电脑上的会话继续开着", "Messages here go to that session on the computer. Closing or deleting this topic only disconnects Telegram; the session keeps running"),
@@ -247,7 +277,7 @@ export class Lifecycle {
       const ctx = parseCtx(st?.agent?.tokens?.context);
       const name = this.name(thread, b);
       const when = ago(state === "closed" ? b.closedAt : b.lastActive);
-      const bits = [STATE_LABEL()[state] ?? state, `<a href="${this.link(thread)}">${esc(cut(name, 40))}</a>`, b.attached ? tr("电脑会话", "desktop") : "", ctx ? `ctx ${esc(ctx.text)}` : "", when];
+      const bits = [STATE_LABEL()[state] ?? state, `<a href="${this.link(thread)}">${esc(cut(name, 40))}</a>`, b.kind === "codex" ? "Codex" : "Claude", b.attached ? tr("电脑会话", "desktop") : "", ctx ? `ctx ${esc(ctx.text)}` : "", when];
       lines.push(bits.filter(Boolean).join(" · "));
       const short = cut(name, 12);
       const del = { text: tr(`删除 ${short}`, `Delete ${short}`), callback_data: `lc:delask:${thread}` };

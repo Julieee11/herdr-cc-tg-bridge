@@ -11,10 +11,12 @@ import type { Store } from "./store";
 import { MAX_DOWNLOAD, REACT, type Telegram } from "./telegram";
 import { limitsLine } from "./usage";
 import { locale, tr, zh } from "./i18n";
+import { newSessionSpec } from "./providers";
 
 const HELP = () => (zh() ? [
   "<b>tg-bridge 用法</b>",
   "• <code>/new 名字</code>：新建话题和会话。也可以在客户端里手动建话题",
+  "• <code>/new codex 名字</code>：新建 Codex 会话；<code>/new claude 名字</code> 新建 Claude 会话",
   "• 电脑上已经在聊的会话，在那个会话里用 <code>/tg-bind</code> 接到这里",
   "• 在话题里发文字、图片、文件：送进对应会话",
   "• 话题里的 <code>/clear</code> 等斜杠命令原样送进会话",
@@ -26,6 +28,7 @@ const HELP = () => (zh() ? [
 ] : [
   "<b>How to use tg-bridge</b>",
   "• <code>/new name</code>: new topic and session. Creating a topic in the client works too",
+  "• <code>/new codex name</code>: start Codex; <code>/new claude name</code>: start Claude",
   "• A session already running on the computer: run <code>/tg-bind</code> in it to bring it here",
   "• Text, photos and files sent in a topic go to its session",
   "• <code>/clear</code> and other slash commands in a topic are passed to the session",
@@ -85,10 +88,10 @@ export class Router {
     if (cmd === "/help" || cmd === "/start") { await this.tg.send(thread, HELP()); return; }
     if (cmd === "/status") { await this.tg.send(thread, this.status.text(undefined, this.status.paused)); return; }
     if (cmd === "/new") {
-      const name = rest.join(" ");
+      const { kind, name } = newSessionSpec(rest, this.cfg.agentKind);
       const j = await this.tg.call("createForumTopic", { chat_id: this.cfg.chatId, name: cut(name || `${tr("新会话", "New session")} ${new Date().toLocaleTimeString(locale(), { hour12: false })}`, 120) });
       if (!j.ok) { await this.tg.notice(thread, tr(`❌ 建话题失败：${esc(j.description ?? "")}`, `❌ Could not create the topic: ${esc(j.description ?? "")}`)); return; }
-      await this.life.open(j.result.message_thread_id, { name: cut(name || `tg-${j.result.message_thread_id}`, 40), autoName: !name, fresh: true });
+      await this.life.open(j.result.message_thread_id, { kind, name: cut(name || `tg-${j.result.message_thread_id}`, 40), autoName: !name, fresh: true });
       return;
     }
     if (cmd === "/sessions") {

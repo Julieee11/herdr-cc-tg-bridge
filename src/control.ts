@@ -8,6 +8,7 @@ import type { Router } from "./router";
 import type { Status } from "./status";
 import type { Store } from "./store";
 import type { Telegram } from "./telegram";
+import { agentKind } from "./providers";
 
 export function startControl(cfg: Config, tg: Telegram, store: Store, status: Status, router: Router, life: Lifecycle) {
   return Bun.serve({
@@ -41,7 +42,8 @@ export function startControl(cfg: Config, tg: Telegram, store: Store, status: St
           await life.close(thread, false);
           return Response.json({ ok: true, thread, closed: true });
         }
-        const r = await life.attach(String(body.pane));
+        if (body.kind !== undefined && !agentKind(body.kind)) return Response.json({ ok: false, error: "unsupported agent kind" }, { status: 400 });
+        const r = await life.attach(String(body.pane), { kind: agentKind(body.kind), session: typeof body.session === "string" ? body.session : undefined });
         return Response.json(r, { status: r.ok ? 200 : 409 });
       }
       if (url.pathname === "/sim" && cfg.sim && body.callback) {

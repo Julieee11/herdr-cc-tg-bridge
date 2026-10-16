@@ -1,8 +1,10 @@
 // Persistent bridge state: Telegram update offset and topic <-> pane bindings.
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { join } from "path";
+import type { AgentKind } from "./providers";
 
 export type Binding = {
+  kind?: AgentKind;     // absent in pre-Codex state files: Claude, for backwards compatibility
   pane: string; tab?: string; session?: string; cwd: string; title?: string; autoName?: boolean;
   name?: string;        // label given when the topic was bound; shown until the session has a title
   terminal?: string;    // Herdr terminal id of the pane, so a reused pane id is never mistaken for ours
