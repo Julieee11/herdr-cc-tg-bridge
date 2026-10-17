@@ -8,9 +8,10 @@ import type { Router } from "./router";
 import type { Status } from "./status";
 import type { Store } from "./store";
 import type { Telegram } from "./telegram";
-import { agentKind } from "./providers";
 
 export function startControl(cfg: Config, tg: Telegram, store: Store, status: Status, router: Router, life: Lifecycle) {
+  // a Codex caller's own session id wins over its pane, which can be wrong under Codex's shared app-server
+  const topicOf = (body: any) => typeof body.session === "string" ? store.topicOfSession(body.session) : store.topicOfPane(String(body.pane ?? ""));
   return Bun.serve({
     hostname: "127.0.0.1",
     port: cfg.port,
@@ -22,8 +23,8 @@ export function startControl(cfg: Config, tg: Telegram, store: Store, status: St
         return Response.json({ ok: false, error: "content-type must be application/json" }, { status: 415 });
       const body: any = req.method === "POST" ? await req.json().catch(() => ({})) : {};
       if (url.pathname === "/send") {
-        const thread = body.thread ?? store.topicOfPane(String(body.pane ?? ""));
-        if (!thread) return Response.json({ ok: false, error: "this pane is not bound to a Telegram topic" }, { status: 404 });
+        const thread = body.thread ?? topicOf(body);
+        if (!thread) return Response.json({ ok: false, error: "this session is not bound to a Telegram topic" }, { status: 404 });
         const sent: string[] = [];
         if (body.text) { await tg.send(thread, esc(String(body.text))); sent.push("text"); }
         for (const p of body.paths ?? []) {
@@ -37,13 +38,12 @@ export function startControl(cfg: Config, tg: Telegram, store: Store, status: St
         // bin/tg-bind from inside a desktop session
         if (!body.pane) return Response.json({ ok: false, error: "missing pane" }, { status: 400 });
         if (body.off) {
-          const thread = store.topicOfPane(String(body.pane));
-          if (!thread) return Response.json({ ok: false, error: "this pane is not bound to a Telegram topic" }, { status: 404 });
+          const thread = topicOf(body);
+          if (!thread) return Response.json({ ok: false, error: "this session is not bound to a Telegram topic" }, { status: 404 });
           await life.close(thread, false);
           return Response.json({ ok: true, thread, closed: true });
         }
-        if (body.kind !== undefined && !agentKind(body.kind)) return Response.json({ ok: false, error: "unsupported agent kind" }, { status: 400 });
-        const r = await life.attach(String(body.pane), { kind: agentKind(body.kind), session: typeof body.session === "string" ? body.session : undefined });
+        const r = await life.attach(String(body.pane), typeof body.session === "string" ? body.session : undefined);
         return Response.json(r, { status: r.ok ? 200 : 409 });
       }
       if (url.pathname === "/sim" && cfg.sim && body.callback) {

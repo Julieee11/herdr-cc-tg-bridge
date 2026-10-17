@@ -8,14 +8,15 @@ import { pickOutbox } from "./outbox";
 import { bubble, commentLine, cut, esc, mdChunks, toolLine } from "./render";
 import type { Binding, Store } from "./store";
 import { REACT, type SendState, type Telegram } from "./telegram";
-import { TranscriptTail, findSessionTranscript, transcriptParser, type TEvent } from "./transcript";
-import { reportedKind } from "./providers";
+import { TranscriptTail, codexSessionMeta, findTranscript, transcriptParser, type TEvent } from "./transcript";
+import { agentKind, codexSessionName, panesShowing } from "./providers";
 import { parseCtx, type Ctx } from "./usage";
 import { tr } from "./i18n";
 
 type Turn = {
   bubble?: number; lines: string[]; texts: string[]; calls: number; t0: number;
   lastEdit: number; dirty: boolean; sawWorking: boolean; written: string[];
+  aborted?: boolean; // Codex reported the turn as interrupted
   msgs: number[]; // Telegram messages this turn answers: they get its outcome as a reaction
 };
 // What the last answer was made of and whether each part is known to have arrived, for /resend.
@@ -23,8 +24,6 @@ type Answer = { msgs: number[]; items: { html?: string; file?: string; state: Se
 const NO_BUBBLE = -1; // the bubble send had no reply: sending another could show it twice
 
 const CTX_WARN = 80;
-
-export const findTranscript = findSessionTranscript;
 
 export class Watcher {
   status = "unknown";
@@ -39,8 +38,10 @@ export class Watcher {
   private afterEnd = false; // turn closed by end_turn while Herdr still says working: wait for new transcript activity
   private busy = 0; // start time of the running tick, 0 when idle
   private nextNameCheck = 0;
-  private nameSync?: Promise<void>;
-  private stopped = false;
+  private naming?: Promise<void>;
+  private refused?: string; // a session id from Herdr that started in another folder: never this pane's
+  private told?: string;    // the session id last logged as not followed yet
+  private recheckAt = 0;    // a session id that cannot be placed yet is looked at again from then on
   private timer: Timer;
 
   constructor(public thread: number, public bind: Binding, private cfg: Config, private tg: Telegram, private store: Store) {
@@ -60,6 +61,7 @@ export class Watcher {
   }
 
   stop() { this.stopped = true; clearInterval(this.timer); }
+  private stopped = false;
 
   noteFromTg(text: string, msg?: number) {
     this.fromTg.push({ text: text.trim(), msg, at: Date.now() });
@@ -86,7 +88,8 @@ export class Watcher {
     }
     this.missing = 0;
     const a = st.agent!;
-    this.queueTabNameSync(a);
+    // on its own, one at a time: a slow Herdr or Telegram call for the name must not hold back the answer
+    this.naming ??= this.syncTabName(a).catch(e => log("tab name", this.thread, e)).finally(() => { this.naming = undefined; });
     this.ctx = parseCtx(a.tokens?.context) ?? this.ctx;
     if (this.bind.notified || (!this.bind.terminal && st.terminal)) {
       this.bind.notified = undefined;
@@ -94,11 +97,10 @@ export class Watcher {
       this.store.save();
     }
     const sid = a.agent_session?.value;
-    const kind = reportedKind(a) ?? this.bind.kind ?? "claude";
-    if (sid && (sid !== this.bind.session || kind !== (this.bind.kind ?? "claude"))) {
+    if (sid && sid !== this.bind.session && sid !== this.refused && await this.follows(sid, a)) {
       // new session in the same pane (/clear, restart): read the new transcript from its start
       this.bind.session = sid;
-      this.bind.kind = kind;
+      this.bind.kind = agentKind(a.agent) ?? this.bind.kind;
       this.store.save();
       this.tail = undefined;
     }
@@ -136,7 +138,7 @@ export class Watcher {
 
   private async onEvent(ev: TEvent) {
     if (ev.kind === "title") return this.onTitle(ev.title);
-    if (ev.kind === "end" || ev.kind === "aborted") return;
+    if (ev.kind === "end") return;
     this.afterEnd = false;
     if (ev.kind === "user" || ev.kind === "queued") {
       if (ev.text.startsWith("<")) return; // command / system wrappers
@@ -166,7 +168,7 @@ export class Watcher {
     if (!done && (!t.dirty || Date.now() - t.lastEdit < 1500)) return;
     t.dirty = false;
     t.lastEdit = Date.now();
-    const html = bubble(t.lines, t.calls, Math.floor((Date.now() - t.t0) / 1000), done, 3600, done && this.ctx ? `ctx ${this.ctx.text}` : "");
+    const html = bubble(t.lines, t.calls, Math.floor((Date.now() - t.t0) / 1000), done && t.aborted ? "interrupted" : done, 3600, done && this.ctx ? `ctx ${this.ctx.text}` : "");
     if (t.bubble === NO_BUBBLE) return;
     if (t.bubble && (await this.tg.edit(t.bubble, html))) return;
     const r = await this.tg.sendState(this.thread, html);
@@ -177,24 +179,21 @@ export class Watcher {
     // Finish at each boundary before reading the next turn, even when several turns arrive in one poll.
     for (const ev of events) {
       await this.onEvent(ev);
-      if ((ev.kind === "end" || ev.kind === "aborted") && this.turn) {
-        await this.finish(ev.kind === "aborted");
+      if (ev.kind === "end" && this.turn) {
+        this.turn.aborted = ev.aborted;
+        await this.finish();
         this.afterEnd = this.status === "working";
       }
     }
   }
 
-  private async finish(aborted = false) {
+  private async finish() {
     const t = this.turn!;
-    if (aborted) {
-      t.texts = [];
-      t.lines.push(tr("⏹ 本轮已中断", "⏹ This turn was interrupted"));
-    }
     await this.render(true);
     this.turn = undefined;
     this.bind.lastActive = Date.now();
     this.store.save();
-    const final = t.texts.join("\n\n").trim();
+    const final = t.aborted ? "" : t.texts.join("\n\n").trim(); // an interrupted turn has no answer to send
     const chunks = mdChunks(final);
     const files = pickOutbox(t.written, this.cfg);
     // Telegram messages that never matched a transcript entry would stay marked forever: once the session is
@@ -224,6 +223,35 @@ export class Watcher {
     const emoji = states.includes("failed") ? REACT.failed : states.includes("unknown") ? REACT.unsure : undefined;
     for (const m of a.msgs) this.tg.react(m, emoji);
   }
+
+  // Codex's shared app-server runs every session's hooks with the first pane's environment, so Herdr can report
+  // another pane's session here. Follow a new id only if no other topic has it and it started in this pane's folder;
+  // a shared session must also show its name in this pane's title. One that cannot be told yet (no rollout or name
+  // before its first message, title not updated) is looked at again a few seconds later.
+  private async follows(sid: string, a: H.Agent): Promise<boolean> {
+    if (Date.now() < this.recheckAt) return false;
+    const other = this.store.topicOfSession(sid);
+    let why = other !== undefined && other !== this.thread ? `bound to topic ${other}` : "";
+    if (!why && (agentKind(a.agent) ?? this.bind.kind) === "codex") {
+      const path = findTranscript(a.cwd, sid, "codex");
+      const meta = path ? codexSessionMeta(path) : undefined;
+      const name = meta?.shared ? codexSessionName(sid) : undefined;
+      if (meta && meta.cwd !== a.cwd) { this.refused = sid; log("session", this.thread, "not following", sid, "started in another folder"); return false; }
+      if (!meta) why = "no session file yet";
+      else if (meta.shared && !name) why = "no session name yet";
+      else if (name) {
+        const hits = panesShowing(await H.agentList(), a.cwd, name); // the same rule as tg-bind
+        if (hits.length !== 1 || hits[0] !== this.bind.pane)
+          why = hits.length > 1 ? `"${name}" is in ${hits.length} panes` : hits.length ? `"${name}" is in another pane` : `"${name}" is not in this pane's title`;
+      }
+    }
+    if (!why) return true;
+    // bindings, files, names and titles change, so look again a few seconds later; say why once per session id
+    this.recheckAt = Date.now() + 5000;
+    if (this.told !== sid) { this.told = sid; log("session", this.thread, "not following yet", sid, why); }
+    return false;
+  }
+
 
   // /resend: the parts of the last answer that did not surely arrive
   async resend() {
@@ -271,31 +299,23 @@ export class Watcher {
   }
 
   private async onTitle(title: string) {
-    if (this.bind.attached || !this.bind.autoName || this.bind.title === title) return;
+    if (this.bind.attached || !this.bind.autoName || this.bind.title === title) return; // a desktop topic follows its tab label
     this.bind.title = title;
     this.store.save();
     await this.tg.call("editForumTopic", { chat_id: this.tg.chatId, message_thread_id: this.thread, name: cut(title, 120) });
-    if (this.bind.tab && !this.bind.attached) await H.tabRename(this.bind.tab, title); // a desktop tab keeps its own name
+    if (this.bind.tab) await H.tabRename(this.bind.tab, title);
   }
 
-  // Attached desktop sessions follow Herdr's tab label, including manual renames.
-  // Failed edits remain retryable; a transcript-generated title never overwrites the user's tab name.
-  private queueTabNameSync(a: H.Agent) {
-    if (this.stopped || !this.bind.attached || this.nameSync || Date.now() < this.nextNameCheck) return;
-    this.nameSync = this.syncTabName(a).catch(e => log("topic name sync", this.thread, e)).finally(() => {
-      this.nextNameCheck = Date.now() + 10_000;
-      this.nameSync = undefined;
-    });
-  }
-
+  // Desktop topics follow their Herdr tab label, checked every 10 s; a failed edit is tried again next time.
   private async syncTabName(a: H.Agent) {
+    if (!this.bind.attached || Date.now() < this.nextNameCheck) return;
+    this.nextNameCheck = Date.now() + 10_000;
     const label = await H.tabLabel(a.workspace_id, a.tab_id);
     if (!label || this.stopped) return;
     const name = cut(label, 120);
     if (name === this.bind.title) return;
     const r = await this.tg.call("editForumTopic", { chat_id: this.tg.chatId, message_thread_id: this.thread, name });
-    if (this.stopped || this.store.state.topics[this.thread] !== this.bind) return;
-    if (!r.ok && !String(r.description).includes("TOPIC_NOT_MODIFIED")) return;
+    if (this.stopped || (!r.ok && !String(r.description).includes("TOPIC_NOT_MODIFIED"))) return;
     this.bind.title = name;
     this.store.save();
   }

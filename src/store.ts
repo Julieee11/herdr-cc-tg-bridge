@@ -36,4 +36,9 @@ export class Store {
     const hit = Object.entries(this.state.topics).find(([, b]) => b.pane === pane && !b.closedAt);
     return hit ? Number(hit[0]) : undefined;
   }
+  // Codex sessions name themselves (CODEX_THREAD_ID): their HERDR_PANE_ID can be another pane's, see Watcher.tick
+  topicOfSession(session: string): number | undefined {
+    const hit = Object.entries(this.state.topics).find(([, b]) => b.session === session && !b.closedAt);
+    return hit ? Number(hit[0]) : undefined;
+  }
 }

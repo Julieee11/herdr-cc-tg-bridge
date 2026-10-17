@@ -91,7 +91,11 @@ export class Router {
       const { kind, name } = newSessionSpec(rest, this.cfg.agentKind);
       const j = await this.tg.call("createForumTopic", { chat_id: this.cfg.chatId, name: cut(name || `${tr("新会话", "New session")} ${new Date().toLocaleTimeString(locale(), { hour12: false })}`, 120) });
       if (!j.ok) { await this.tg.notice(thread, tr(`❌ 建话题失败：${esc(j.description ?? "")}`, `❌ Could not create the topic: ${esc(j.description ?? "")}`)); return; }
-      await this.life.open(j.result.message_thread_id, { kind, name: cut(name || `tg-${j.result.message_thread_id}`, 40), autoName: !name, fresh: true });
+      const tid = j.result.message_thread_id;
+      if (await this.life.open(tid, { kind, name: cut(name || `tg-${tid}`, 40), autoName: !name, fresh: true })) return;
+      // nothing is bound yet, so a message in the empty topic would start the default agent rather than the one asked for
+      await this.tg.call("deleteForumTopic", { chat_id: this.cfg.chatId, message_thread_id: tid });
+      await this.tg.notice(thread, tr("❌ 会话没有开起来，空话题已删除。确认电脑上的 Herdr 在运行，再发一次 /new", "❌ The session did not start, so the empty topic was removed. Check that Herdr is running on the computer, then send /new again"));
       return;
     }
     if (cmd === "/sessions") {

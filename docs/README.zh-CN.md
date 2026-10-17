@@ -2,6 +2,8 @@
 
 在 Telegram 群的话题里使用电脑上的 Claude Code 会话。一个话题对应一个会话，会话由终端会话管理器 [Herdr](https://herdr.dev) 管理。你在手机上操作的就是电脑上那个会话本身，记忆、配置、hook、skill 都照常生效。回到电脑前，在终端里打开 Herdr 就能接着用。
 
+**也支持 Codex：** `/new codex 名字` 开 Codex 会话，`/new claude 名字` 开 Claude 会话；原有的 Claude 话题不受影响。在 Herdr 里运行中的 Codex 会话里输入 `$tg-bind` 就能接到 Telegram（安装脚本会问要不要启用）。说明见 [Codex 接入与范围](PRD-v3-codex.md)。
+
 这是一个用 Bun 写的小程序，没有运行时依赖，装好后的命令名叫 `tg-bridge`。本项目是个人独立项目，与 Anthropic 没有关联，也没有得到 Anthropic 的认可。它运行的是官方原版 Claude Code，用的是你自己的账号。
 
 ## 快速上手

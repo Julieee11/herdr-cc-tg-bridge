@@ -40,11 +40,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const expand = (p: string) => resolve(p.replace(/^~(?=\/|$)/, homedir()));
   const kind = agentKind(env.TG_AGENT_KIND?.trim() || "claude");
   if (!kind) throw new Error("TG_AGENT_KIND must be claude or codex");
-  let codexArgs: unknown;
-  try { codexArgs = JSON.parse(env.TG_CODEX_ARGS || "[]"); }
-  catch { throw new Error("TG_CODEX_ARGS must be a JSON array of strings"); }
-  if (!Array.isArray(codexArgs) || !codexArgs.every(x => typeof x === "string"))
-    throw new Error("TG_CODEX_ARGS must be a JSON array of strings");
   return {
     token,
     chatId: Number(chat),
@@ -57,7 +52,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     autosendExt: new Set((env.TG_AUTOSEND_EXT ?? DEFAULT_EXT).split(",").map(s => s.trim().toLowerCase().replace(/^\./, "")).filter(Boolean)),
     claudeArgs: (env.TG_CLAUDE_ARGS ?? "").split(/\s+/).filter(Boolean),
     agentKind: kind,
-    codexArgs,
+    codexArgs: (env.TG_CODEX_ARGS ?? "").split(/\s+/).filter(Boolean),
     statusIntervalSec: Number(env.TG_STATUS_INTERVAL ?? 30),
     onlineWindowSec: Number(env.TG_ONLINE_WINDOW ?? 90),
     statusPauseAfter: Number(env.TG_STATUS_PAUSE_AFTER ?? 3),

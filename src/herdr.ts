@@ -13,9 +13,9 @@ export async function herdr(...args: string[]): Promise<any> {
 }
 
 export type Agent = {
-  agent_kind?: string; kind?: string; agent?: string;
+  agent?: string; // agent kind: "claude", "codex", ...
   pane_id: string; tab_id: string; workspace_id: string; agent_status: string;
-  agent_session?: { value: string; source?: string }; cwd: string; terminal_title_stripped?: string;
+  agent_session?: { value: string }; cwd: string; terminal_title_stripped?: string;
   terminal_id?: string; tokens?: Record<string, string>; // tokens.context, e.g. "⛁ 43% (430k)", for hooked Claude sessions
 };
 

@@ -4,8 +4,7 @@
 
 herdr-cc-tg-bridge connects a Telegram group (with Topics enabled) to the Claude Code sessions running in Herdr on your computer. What you drive from your phone *is* the session on your desk: same memory, same `CLAUDE.md`, same hooks and skills. Back at the computer, keep typing in the same Herdr tab.
 
-**Codex support:** `/new codex name` starts Codex; `/new claude name` starts Claude. Existing Claude topics keep their behavior. Run `bin/tg-bind` inside a live Herdr Codex session to attach it. See [Codex setup and scope](docs/PRD-v3-codex.md).
-
+**Codex support:** `/new codex name` starts Codex; `/new claude name` starts Claude. Existing Claude topics keep their behavior. Type `$tg-bind` in a live Herdr Codex session to attach it (the installer offers to set it up). See [Codex setup and scope](docs/PRD-v3-codex.md).
 
 It is a small Bun program with no runtime dependencies. The command it installs is called `tg-bridge`.
 
@@ -235,6 +234,8 @@ The installer does all of this for you. These are the same steps by hand, for Li
    `install-launchd` accepts `TG_BRIDGE_LABEL` and `TG_BRIDGE_LAUNCH_PREFIX` (a command put before `bin/tg-bridge`, e.g. a secret injector). If the project lives in a privacy-protected folder such as `~/Desktop`, grant `/bin/bash` Full Disk Access first, or the background job cannot read the files.
 
 6. **Optional: `/tg-bind` in Claude Code.** Create a skill (for example `~/.claude/skills/tg-bind/SKILL.md`) that runs `<repo>/bin/tg-bind` for `/tg-bind` and `<repo>/bin/tg-bind off` for `/tg-bind off`, and tells the session that its replies are now read on a phone. Running `bin/tg-bind` yourself in that pane does the same.
+
+   **In Codex**, which has no custom slash commands, the same skill is called as `$tg-bind`; `install.sh` offers to add it to `~/.codex/skills/tg-bind`. Codex runs the skill's command in its sandbox, which cannot reach the bridge on 127.0.0.1, so the first time it asks for approval; choose "don't ask again" and it remembers. If Codex never asks (`approval_policy = "never"`) and its sandbox has no network, either set `approval_policy = "on-request"` or allow the bridge's two commands in `~/.codex/rules/default.rules` (the installer offers this only in that case); a running Codex background server reads new rules after `codex app-server daemon restart`. Typing `!<repo>/bin/tg-bind` runs it yourself, outside the sandbox.
 
 ## Usage
 

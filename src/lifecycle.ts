@@ -6,18 +6,20 @@ import type { Config } from "./config";
 import * as H from "./herdr";
 import { log } from "./log";
 import { cut, esc, mdChunks } from "./render";
-import { findTranscript, Watcher } from "./session";
+import { Watcher } from "./session";
 import type { Binding, Store } from "./store";
 import type { Telegram } from "./telegram";
-import { transcriptParser } from "./transcript";
-import { launchArgs, reportedKind, type AgentKind } from "./providers";
+import { codexSessionMeta, findTranscript, transcriptParser } from "./transcript";
+import { agentKind, codexInstructions, codexSessionName, launchArgs, panesShowing, type AgentKind } from "./providers";
 import { parseCtx } from "./usage";
 import { tr } from "./i18n";
 
-const SPAWN_PROMPT = (tgSend: string) =>
-  `This Claude Code session is being driven from a Telegram forum topic through tg-bridge; the user reads your replies on a phone. ` +
-  `Files you create with the Write tool in common deliverable formats are sent to the user automatically at the end of the turn. ` +
-  `For anything else the user should receive (files produced by scripts or commands, screenshots, existing files), run: ${tgSend} <path> [<path> ...]. ` +
+const SPAWN_PROMPT = (kind: AgentKind, tgSend: string) =>
+  `This ${kind === "codex" ? "Codex" : "Claude Code"} session is being driven from a Telegram forum topic through tg-bridge; the user reads your replies on a phone. ` +
+  (kind === "claude" ? `Files you create with the Write tool in common deliverable formats are sent to the user automatically at the end of the turn. ` +
+  `For anything else the user should receive (files produced by scripts or commands, screenshots, existing files), run: ${tgSend} <path> [<path> ...]. `
+  : `To send the user a file (anything you produced, screenshots, existing files), run: ${tgSend} <path> [<path> ...]. ` +
+    `It posts to the bridge on 127.0.0.1, so a sandbox without network makes it fail (curl exit code 7); then run it again with escalated permissions. `) +
   `Attachments the user sends arrive as local file paths in the message.`;
 
 export const ago = (t: number | undefined, now = Date.now()) => {
@@ -41,10 +43,11 @@ export function lastExchange(text: string, kind: AgentKind = "claude"): { ask?: 
       else if (ev.kind === "text") texts.push(ev.text);
       else if (ev.kind === "tool") texts = [];
       else if (ev.kind === "end") {
-        const final = texts.join("\n\n").trim();
+        // an interrupted turn has no answer: keep the exchange before it rather than pair its ask with an old answer
+        const final = ev.aborted ? "" : texts.join("\n\n").trim();
         if (final) { ask = pendingAsk ?? ask; answer = final; }
-        pendingAsk = undefined; texts = [];
-      } else if (ev.kind === "aborted") { pendingAsk = undefined; texts = []; }
+        texts = [];
+      }
     }
   }
   return { ask, answer, title };
@@ -57,7 +60,6 @@ const STATE_LABEL = (): Record<string, string> => ({
 
 export class Lifecycle {
   private checking = new Set<number>();
-  private attaches = new Map<string, Promise<unknown>>();
 
   constructor(
     private cfg: Config, private tg: Telegram, private store: Store,
@@ -106,7 +108,7 @@ export class Lifecycle {
     if (st?.state === "live" && !old!.attached) await H.paneClose(old!.pane);
 
     const resume = !opts.fresh && this.canResume(old);
-    const kind = opts.kind ?? old?.kind ?? (old ? "claude" : this.cfg.agentKind ?? "claude");
+    const kind = opts.kind ?? old?.kind ?? (old ? "claude" : this.cfg.agentKind); // bindings from before Codex support are Claude
     const label = cut(this.name(thread, old ?? { name: opts.name } as Binding), 40);
     const ws = await H.resolveWorkspace(this.cfg.workspace);
     const s = await H.spawnAgent({
@@ -115,7 +117,8 @@ export class Lifecycle {
       cwd: resume ? old!.cwd : this.cfg.workdir, label, agent: `tg-${thread}`,
       pane: st?.state === "exited" && !old!.attached ? old!.pane : undefined,
       args: launchArgs(kind, resume ? old!.session : undefined,
-        kind === "codex" ? this.cfg.codexArgs ?? [] : this.cfg.claudeArgs, SPAWN_PROMPT(this.tgSendPath)),
+        kind === "codex" ? this.cfg.codexArgs : this.cfg.claudeArgs, SPAWN_PROMPT(kind, this.tgSendPath),
+        kind === "codex" ? await codexInstructions(this.cfg.codexArgs, resume ? old!.cwd : this.cfg.workdir) : undefined),
     });
     if (!s) { await this.tg.notice(thread, tr("❌ 开会话失败，Herdr 没有返回窗格", "❌ Could not open a session: Herdr returned no pane")); return false; }
     this.unwatch(thread);
@@ -135,48 +138,54 @@ export class Lifecycle {
   }
 
   // /tg-bind from inside a desktop session: new topic, handoff card, last answer, then live sync.
-  async attach(pane: string, expected?: { kind?: AgentKind; session?: string }): Promise<{ ok: boolean; thread?: number; error?: string; already?: boolean }> {
-    // Concurrent local bind calls must not both create a topic for the same pane.
-    const before = this.attaches.get(pane) ?? Promise.resolve();
-    const current = before.catch(() => {}).then(() => this.attachOnce(pane, expected));
-    this.attaches.set(pane, current);
-    try { return await current; }
-    finally { if (this.attaches.get(pane) === current) this.attaches.delete(pane); }
+  // `session` is the caller's own session id when it knows it (Codex), so a wrong HERDR_PANE_ID cannot bind a neighbour.
+  // One at a time: two calls for the same session (a retry, a double press) must not open two topics.
+  attach(pane: string, session?: string): Promise<{ ok: boolean; thread?: number; error?: string; already?: boolean }> {
+    const run = this.attaching.then(() => this.attachOne(pane, session));
+    this.attaching = run.catch(() => {});
+    return run;
   }
+  private attaching: Promise<unknown> = Promise.resolve();
 
-  private async attachOnce(pane: string, expected?: { kind?: AgentKind; session?: string }): Promise<{ ok: boolean; thread?: number; error?: string; already?: boolean }> {
+  private async attachOne(pane: string, session?: string): Promise<{ ok: boolean; thread?: number; error?: string; already?: boolean }> {
+    if (session) {
+      const bound = this.store.topicOfSession(session);
+      if (bound) return { ok: true, thread: bound, already: true };
+    }
+    const shared = session ? await this.paneOfShared(session) : undefined;
+    if (shared && "error" in shared) return { ok: false, error: shared.error };
+    if (shared) pane = shared.pane;
     const st = await H.paneState(pane);
-    if (st.state === "unknown") return { ok: false, error: "Herdr is not answering" };
-    if (st.state !== "live") return { ok: false, error: "no supported agent session is running in this pane" };
-    const a = st.agent!;
-    const session = a.agent_session?.value;
-    if (!session) return { ok: false, error: "Herdr has no session id for this pane; install the agent's Herdr integration and restart the session" };
-    if (expected?.session && expected.session !== session)
-      return { ok: false, error: "session id does not match this Herdr pane; refusing to bind another session" };
-    const kind = reportedKind(a) ?? (existsSync(findTranscript(a.cwd, session, "codex")) ? "codex" : "claude");
-    if (expected?.kind && expected.kind !== kind)
-      return { ok: false, error: "agent kind does not match this Herdr pane" };
-    const path = findTranscript(a.cwd, session, kind);
-    if (!path || !existsSync(path)) return { ok: false, error: `${kind} transcript not found for this session; no topic was created` };
-    const bound = this.store.topicOfPane(pane);
-    const current = bound ? this.store.state.topics[bound] : undefined;
-    if (current && current.terminal && current.terminal !== st.terminal)
-      return { ok: false, error: "pane terminal changed; disconnect the old binding first" };
-    if (bound) return { ok: true, thread: bound, already: true };
-    // bound before and then closed in Telegram: reopen that topic rather than open a second one for the same pane
-    const closed = Object.entries(this.store.state.topics).find(([, b]) => b.pane === pane && b.closedAt && b.terminal === st.terminal);
+    // a binding counts only for the terminal it was made in: Herdr reuses pane ids
+    const mine = (b: Binding) => b.pane === pane && b.terminal === st.terminal;
+    const open = Object.entries(this.store.state.topics).find(([, b]) => mine(b) && !b.closedAt);
+    if (open && session) return { ok: false, error: "this pane is bound to another session; not bound" };
+    if (open && st.state === "live") return { ok: true, thread: Number(open[0]), already: true };
+    // bound before and then closed in Telegram: reopen that topic rather than open a second one for the same session.
+    // For a Codex caller the pane must be running that session: by its title when shared, else as Herdr reports it.
+    const running = !session || shared || st.agent?.agent_session?.value === session;
+    const closed = Object.entries(this.store.state.topics).find(([, b]) => mine(b) && b.closedAt && (!session || (b.session === session && running)));
     if (closed && st.state === "live") {
       const ok = await this.open(Number(closed[0]));
       return ok ? { ok, thread: Number(closed[0]) } : { ok, error: "could not reopen the earlier topic" };
     }
-    const ex = lastExchange(readFileSync(path, "utf8"), kind);
+    if (st.state === "unknown") return { ok: false, error: "Herdr is not answering" };
+    if (st.state !== "live") return { ok: false, error: "no Claude or Codex session is running in this pane" };
+    const a = st.agent!;
+    const kind = a.agent === undefined ? "claude" : agentKind(a.agent); // a Herdr that does not report the kind ran Claude only
+    if (!kind) return { ok: false, error: `${a.agent} sessions are not supported; only Claude and Codex` };
+    const sid = shared ? session : a.agent_session?.value; // Herdr credits a shared session to another pane
+    if (!sid) return { ok: false, error: `Herdr has no session id for this pane: the session was started before \`herdr integration install ${kind}\`, so its transcript cannot be found` };
+    if (session && session !== sid) return { ok: false, error: "this pane runs another session; not bound" };
+    const path = findTranscript(a.cwd, sid, kind);
+    const ex = existsSync(path) ? lastExchange(readFileSync(path, "utf8"), kind) : {};
     const tabTitle = await H.tabLabel(a.workspace_id, a.tab_id);
     const title = cut(tabTitle || ex.title || cleanTitle(a.terminal_title_stripped) || tr("电脑会话", "Desktop session"), 120);
     const j = await this.tg.call("createForumTopic", { chat_id: this.cfg.chatId, name: title });
     if (!j.ok) return { ok: false, error: `createForumTopic failed: ${j.description}` };
     const thread: number = j.result.message_thread_id;
     this.store.state.topics[thread] = {
-      pane, kind, tab: a.tab_id, terminal: a.terminal_id, session, cwd: a.cwd,
+      pane, kind, tab: a.tab_id, terminal: a.terminal_id, session: sid, cwd: a.cwd,
       name: title, title, autoName: true, attached: true, lastActive: Date.now(),
     };
     this.store.save();
@@ -190,7 +199,7 @@ export class Lifecycle {
     await this.tg.notice(thread, card);
     if (ex.answer) for (const c of mdChunks(ex.answer)) await this.tg.send(thread, c);
     this.watch(thread);
-    log("attach", thread, { pane, session });
+    log("attach", thread, { pane, kind, session: sid });
     return { ok: true, thread };
   }
 
@@ -233,7 +242,20 @@ export class Lifecycle {
     b.title = name;
     b.autoName = false; // a name the user picked is never overwritten by the session title
     this.store.save();
-    if (b.tab && !b.closedAt && !b.attached) await H.tabRename(b.tab, name);
+    if (b.tab && !b.closedAt) await H.tabRename(b.tab, name); // desktop topics follow their tab label, so it changes with them
+  }
+
+  // Codex's shared app-server gives its sessions the first pane's HERDR_PANE_ID, and Herdr credits them to that pane,
+  // so such a session is placed by its name, which Codex shows in its own pane's title. Undefined: not shared.
+  private async paneOfShared(session: string): Promise<{ pane: string } | { error: string } | undefined> {
+    const path = findTranscript("", session, "codex");
+    const meta = path ? codexSessionMeta(path) : undefined;
+    if (!meta?.shared) return;
+    const name = codexSessionName(session);
+    if (!name) return { error: "Codex has not named this session yet; send it a message, then bind again" };
+    const hits = panesShowing(await H.agentList(), meta.cwd!, name);
+    if (hits.length === 1) return { pane: hits[0] };
+    return { error: hits.length ? `several Herdr panes show "${name}"; give this session a unique name with /rename, then bind again` : `no Herdr pane shows "${name}" in its title` };
   }
 
   // A send failed with "message thread not found": the topic was probably deleted. Confirm before acting.
@@ -277,7 +299,7 @@ export class Lifecycle {
       const ctx = parseCtx(st?.agent?.tokens?.context);
       const name = this.name(thread, b);
       const when = ago(state === "closed" ? b.closedAt : b.lastActive);
-      const bits = [STATE_LABEL()[state] ?? state, `<a href="${this.link(thread)}">${esc(cut(name, 40))}</a>`, b.kind === "codex" ? "Codex" : "Claude", b.attached ? tr("电脑会话", "desktop") : "", ctx ? `ctx ${esc(ctx.text)}` : "", when];
+      const bits = [STATE_LABEL()[state] ?? state, `<a href="${this.link(thread)}">${esc(cut(name, 40))}</a>`, b.kind === "codex" ? "Codex" : "", b.attached ? tr("电脑会话", "desktop") : "", ctx ? `ctx ${esc(ctx.text)}` : "", when];
       lines.push(bits.filter(Boolean).join(" · "));
       const short = cut(name, 12);
       const del = { text: tr(`删除 ${short}`, `Delete ${short}`), callback_data: `lc:delask:${thread}` };
